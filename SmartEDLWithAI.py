@@ -1,10 +1,11 @@
-
+# Import necessary libraries for GPIO, sensors, timing, AI model, and logging
 import RPi.GPIO as GPIO
 from gpiozero import Button, LED, Buzzer
 import time
 import math
 import smbus
 import joblib
+import csv
 from datetime import datetime
 
 # GPIO Pins Setup
@@ -13,25 +14,31 @@ RED_LED, YELLOW_LED, GREEN_LED, BLUE_MORSE_LED_PIN = 16, 20, 21, 26
 BUZZER_PIN = 18
 BUTTON = Button(25)
 
-# Initialize Components
+# Initialize LED and buzzer hardware
 BLUE_MORSE_LED = LED(BLUE_MORSE_LED_PIN)
 BUZZER = Buzzer(BUZZER_PIN)
 
-
-import csv
+# Create a CSV file and write headers to log sensor readings and AI predictions
 LOG_FILE = "edl_landing_log.csv"
 with open(LOG_FILE, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(["Timestamp", "T+Time", "Altitude (cm)", "Speed (cm/s)", "Pitch (°)", "Roll (°)", "G-Force (g)", "AI Prediction"])
+
+# Setup GPIO pins for trigger, echo, and LED output
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(TRIG, GPIO.OUT)
 GPIO.setup(ECHO, GPIO.IN)
 GPIO.setup([RED_LED, YELLOW_LED, GREEN_LED], GPIO.OUT)
 
+# Setup I2C communication for MPU6050 accelerometer/gyroscope
 bus = smbus.SMBus(1)
 MPU_ADDR = 0x68
 bus.write_byte_data(MPU_ADDR, 0x6B, 0)
 
+# Load trained AI model and label encoder for classification
+model, label_encoder = joblib.load("edl_trained_model_rf.pkl")
+
+# Function to read 16-bit raw data from MPU6050 registers
 def read_raw_data(addr):
     high = bus.read_byte_data(MPU_ADDR, addr)
     low = bus.read_byte_data(MPU_ADDR, addr + 1)
@@ -40,6 +47,7 @@ def read_raw_data(addr):
         value = value - 65536
     return value
 
+# Function to calculate pitch and roll from accelerometer data
 def get_tilt_angle():
     acc_x = read_raw_data(0x3B)
     acc_y = read_raw_data(0x3D)
@@ -51,6 +59,7 @@ def get_tilt_angle():
     roll = math.degrees(math.atan2(Ay, math.sqrt(Ax**2 + Az**2)))
     return pitch, roll
 
+# Function to compute total G-force from accelerometer readings
 def get_g_force():
     acc_x = read_raw_data(0x3B)
     acc_y = read_raw_data(0x3D)
@@ -61,6 +70,7 @@ def get_g_force():
     g_force = math.sqrt(Ax**2 + Ay**2 + Az**2)
     return round(g_force, 2)
 
+# Function to compute distance using ultrasonic sensor
 def get_distance():
     GPIO.output(TRIG, True)
     time.sleep(0.00001)
@@ -74,16 +84,13 @@ def get_distance():
     distance = (end_time - start_time) * 34300 / 2
     return round(distance, 2)
 
-def ai_predict(model, altitude, descent_speed, pitch, roll, g_force):
-    inputs = [[altitude, descent_speed, pitch, roll, g_force]]
-    prediction = model.predict(inputs)[0]
-    return prediction
-
+# Function to simulate thruster activation (via buzzer)
 def activate_thrusters(duration=2):
     BUZZER.on()
     time.sleep(duration)
     BUZZER.off()
 
+# Function to correct lander orientation using tilt data and log maneuver actions
 def correct_tilt(pitch, roll):
     actions = []
     if pitch > 10:
@@ -97,52 +104,55 @@ def correct_tilt(pitch, roll):
     for action in actions:
         print(action)
     if actions:
-        print("🛠 Tilt correction in progress using directional thrusters.")
+        print("Tilt correction in progress using directional thrusters.")
         BUZZER.on()
         time.sleep(3)
         BUZZER.off()
 
+# Main landing sequence loop: reads sensor data, predicts state, logs, and makes decisions
 def landing_sequence():
-    model = joblib.load("landing_model.pkl")
+    # Flags and timers for mission control
     safe_landing_triggered = False
     t = 0
     parachute_deployed = False
+
     try:
         while True:
             t += 1
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Gather sensor data and compute descent speed
             altitude = get_distance()
             descent_speed = 5 - (altitude / 40)
             pitch, roll = get_tilt_angle()
             g_force = get_g_force()
-            ai_prediction = ai_predict(model, altitude, descent_speed, pitch, roll, g_force)
-            print(f"T+{t}s | Altitude: {altitude}cm | AI: {ai_prediction} | Pitch: {pitch:.2f}° | Roll: {roll:.2f}° | G: {g_force}g")
-            print(f"AI: {ai_prediction} | Alt: {altitude} | Speed: {descent_speed} | Pitch: {pitch} | Roll: {roll} | G: {g_force}")
 
+            # AI prediction based on current sensor readings
+            inputs = [[altitude, descent_speed, pitch, roll, g_force]]
+            prediction = model.predict(inputs)[0]
+            ai_prediction = label_encoder.inverse_transform([prediction])[0]
+
+            # Log telemetry and AI output to CSV and console
+            print(f"T+{t}s | Altitude: {altitude}cm | AI Prediction: {ai_prediction} | Pitch: {pitch:.2f}° | Roll: {roll:.2f}° | G: {g_force}g")
             with open(LOG_FILE, "a", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([timestamp, f"T+{t}s", altitude, descent_speed, pitch, roll, g_force, ai_prediction])
-            if abs(pitch) > 20 or abs(roll) > 20:
-                print("Tilt Risk Detected! Excessive tilt detected: pitch or roll exceeded threshold.")
-                BUZZER.on()
-                time.sleep(1)
-                BUZZER.off()
-
+                
+            # If prediction is 'Failed', determine failure type and initiate maneuvers
             if ai_prediction == "Failed":
                 if abs(pitch) >= 35 or abs(roll) >= 35:
                     print("Failure due to extreme tilt")
                     correct_tilt(pitch, roll)
                 elif descent_speed >= 10:
                     print("Failure due to high descent speed")
-                    print("Applying maximum thruster burn to decelerate...")
                     activate_thrusters(duration=6)
-                    print("High descent speed. Maximum thrust applied to avoid crash.")
                 elif g_force > 2.5:
                     print("Failure due to high impact G-force")
-                    print("Impact detected. G-force exceeded safe threshold. Running diagnostics.")
                     BUZZER.on()
                     time.sleep(2)
                     BUZZER.off()
 
+            # If prediction is 'Unstable', simulate parachute deployment
             if ai_prediction == "Unstable" and not parachute_deployed:
                 print("Deploying Parachute...")
                 BUZZER.on()
@@ -151,6 +161,7 @@ def landing_sequence():
                 parachute_deployed = True
                 time.sleep(5)
 
+            # Set LED indicators based on altitude to represent EDL phases
             GPIO.output([RED_LED, YELLOW_LED, GREEN_LED], False)
             if altitude > 40:
                 GPIO.output(RED_LED, True)
@@ -170,9 +181,11 @@ def landing_sequence():
                 safe_landing_triggered = True
 
             time.sleep(1)
+
+    # Exit on interrupt and cleanup GPIO
     except KeyboardInterrupt:
         print("\nInterrupted. Cleaning up...")
         GPIO.cleanup()
 
-# Start
+# Start the main sequence
 landing_sequence()
