@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 # Import necessary libraries for GPIO, sensors, timing, AI model, and logging
 import RPi.GPIO as GPIO
 from gpiozero import Button, LED, Buzzer
@@ -35,8 +37,8 @@ bus = smbus.SMBus(1)
 MPU_ADDR = 0x68
 bus.write_byte_data(MPU_ADDR, 0x6B, 0)
 
-# Load trained AI model and label encoder for classification
-model, label_encoder = joblib.load("edl_trained_model_rf.pkl")
+# Load trained AI model for classification
+model, label_encoder = joblib.load("edl_trained_model_rf_edited.pkl")
 
 # Function to read 16-bit raw data from MPU6050 registers
 def read_raw_data(addr):
@@ -86,9 +88,11 @@ def get_distance():
 
 # Function to simulate thruster activation (via buzzer)
 def activate_thrusters(duration=2):
+    print("Activate emergency thrusters")
     BUZZER.on()
     time.sleep(duration)
     BUZZER.off()
+   
 
 # Function to correct lander orientation using tilt data and log maneuver actions
 def correct_tilt(pitch, roll):
@@ -115,15 +119,21 @@ def landing_sequence():
     safe_landing_triggered = False
     t = 0
     parachute_deployed = False
+    prev_distance = get_distance()
+    prev_time = time.time()
 
     try:
         while True:
             t += 1
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+            parachute_deployed = False
             # Gather sensor data and compute descent speed
+            current_distance = get_distance()
+            current_time = time.time()
+            time_diff = current_time - prev_time
+            descent_speed = (prev_distance - current_distance) / time_diff if time_diff > 0 else 0
+            descent_speed = round(descent_speed, 2)
             altitude = get_distance()
-            descent_speed = 5 - (altitude / 40)
+            # descent_speed = 5 - (altitude / 40)
             pitch, roll = get_tilt_angle()
             g_force = get_g_force()
 
@@ -133,24 +143,27 @@ def landing_sequence():
             ai_prediction = label_encoder.inverse_transform([prediction])[0]
 
             # Log telemetry and AI output to CSV and console
-            print(f"T+{t}s | Altitude: {altitude}cm | AI Prediction: {ai_prediction} | Pitch: {pitch:.2f}° | Roll: {roll:.2f}° | G: {g_force}g")
+            print(f"T+{t}s | Altitude: {altitude}cm | AI Prediction: {ai_prediction} | Descent Speed: {descent_speed} cm per sec | Pitch: {pitch:.2f}° | Roll: {roll:.2f}° | G: {g_force}g")
             with open(LOG_FILE, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([timestamp, f"T+{t}s", altitude, descent_speed, pitch, roll, g_force, ai_prediction])
+                writer.writerow([current_time, f"T+{t}s", altitude, descent_speed, pitch, roll, g_force, ai_prediction])
                 
             # If prediction is 'Failed', determine failure type and initiate maneuvers
             if ai_prediction == "Failed":
                 if abs(pitch) >= 35 or abs(roll) >= 35:
                     print("Failure due to extreme tilt")
                     correct_tilt(pitch, roll)
+                    
                 elif descent_speed >= 10:
                     print("Failure due to high descent speed")
                     activate_thrusters(duration=6)
+                    
                 elif g_force > 2.5:
                     print("Failure due to high impact G-force")
                     BUZZER.on()
                     time.sleep(2)
                     BUZZER.off()
+                    
 
             # If prediction is 'Unstable', simulate parachute deployment
             if ai_prediction == "Unstable" and not parachute_deployed:
@@ -160,6 +173,7 @@ def landing_sequence():
                 BUZZER.off()
                 parachute_deployed = True
                 time.sleep(5)
+           
 
             # Set LED indicators based on altitude to represent EDL phases
             GPIO.output([RED_LED, YELLOW_LED, GREEN_LED], False)
@@ -179,7 +193,10 @@ def landing_sequence():
                 GPIO.output(GREEN_LED, True)
                 print("SAFE LANDING")
                 safe_landing_triggered = True
-
+                break
+             
+            prev_distance = current_distance
+            prev_time = current_time
             time.sleep(1)
 
     # Exit on interrupt and cleanup GPIO
